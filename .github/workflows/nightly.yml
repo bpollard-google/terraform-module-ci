@@ -1,0 +1,166 @@
+name: nightly
+
+on:
+  workflow_call:
+    inputs:
+      wif-provider:
+        description: Full resource name of the Workload Identity Provider.
+        type: string
+        required: true
+      service-account:
+        description: Email of the service account to impersonate.
+        type: string
+        required: true
+      gcp-project-id:
+        description: Sandbox project the plan and apply run against.
+        type: string
+        required: true
+      run-apply:
+        description: Whether to run tier 3, a real apply followed by a destroy.
+        type: boolean
+        default: false
+      terraform-version:
+        description: Terraform version used by every job.
+        type: string
+        default: "1.13.3"
+
+permissions:
+  contents: read
+
+# cancel-in-progress is false here, the opposite of tier 1. Cancelling a run
+# mid-apply kills the job before its destroy step can run, which is exactly
+# the orphaned-resource outcome the destroy step exists to prevent.
+concurrency:
+  group: nightly-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  tier2-plan:
+    name: tier2-plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        example: [basic, complete]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ inputs.wif-provider }}
+          service_account: ${{ inputs.service-account }}
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        working-directory: examples/${{ matrix.example }}
+        run: terraform init -backend=false -input=false
+
+      - name: terraform plan against real GCP
+        working-directory: examples/${{ matrix.example }}
+        env:
+          GOOGLE_PROJECT: ${{ inputs.gcp-project-id }}
+          TF_VAR_project_id: ${{ inputs.gcp-project-id }}
+        run: terraform plan -input=false -lock=false
+
+  tier3-apply:
+    name: tier3-apply
+    if: inputs.run-apply
+    needs: [tier2-plan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ inputs.wif-provider }}
+          service_account: ${{ inputs.service-account }}
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      # A run-scoped suffix keeps concurrent or retried runs from colliding
+      # on globally unique names such as bucket names.
+      - name: Compute a unique run suffix
+        id: suffix
+        run: echo "value=ci$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: terraform init
+        working-directory: examples/basic
+        run: terraform init -backend=false -input=false
+
+      - name: terraform apply
+        working-directory: examples/basic
+        env:
+          GOOGLE_PROJECT: ${{ inputs.gcp-project-id }}
+          TF_VAR_project_id: ${{ inputs.gcp-project-id }}
+          TF_VAR_name_suffix: ${{ steps.suffix.outputs.value }}
+        run: terraform apply -input=false -auto-approve
+
+      # Output count alone is a static property of the repository checked at
+      # runtime: every basic example declares its outputs unconditionally, so
+      # a non-zero count cannot tell a good apply from a broken one. The
+      # suffix check is the part with real signal — it fails if the module
+      # ignored TF_VAR_name_suffix, which would mean this run applied under a
+      # fixed name that collides with every other run.
+      - name: Assert the apply produced outputs
+        working-directory: examples/basic
+        # Without this GitHub runs the script as `bash -e {0}`, with no
+        # pipefail, so a failure in `terraform output` on the left of a pipe
+        # would be masked by jq succeeding on empty input. `shell: bash` is
+        # `bash --noprofile --norc -eo pipefail {0}`.
+        shell: bash
+        env:
+          SUFFIX: ${{ steps.suffix.outputs.value }}
+        run: |
+          outputs="$(terraform output -json)"
+          echo "$outputs" | jq .
+          if [[ "$(echo "$outputs" | jq 'length')" -eq 0 ]]; then
+            echo "::error::apply produced no outputs"
+            exit 1
+          fi
+          # Without this the check below is vacuous: contains("-" + "") is
+          # contains("-"), which any hyphenated name satisfies, so an empty
+          # suffix would pass while proving nothing.
+          if [[ -z "$SUFFIX" ]]; then
+            echo "::error::run suffix is empty; the suffix step produced no value"
+            exit 1
+          fi
+          # `all`, not `any`: with `any`, one output carrying the suffix
+          # vouches for every other, and the resource that actually collides
+          # between runs can quietly lose its suffix. For the VPC example that
+          # is exactly the subnet — only the network used to appear in an
+          # output, so an unprefixed subnet was reported as success.
+          #
+          # The suffix is matched bare rather than as "-$SUFFIX", because it is
+          # applied as a suffix to some names ("...-basic-ci123") and as a
+          # prefix to others ("ci123-app"). Requiring a leading hyphen silently
+          # excluded the prefixed ones.
+          if ! echo "$outputs" \
+            | jq -e --arg s "$SUFFIX" '[.[].value | tostring] | all(contains($s))' >/dev/null; then
+            echo "::error::an output does not carry the run suffix $SUFFIX; TF_VAR_name_suffix was dropped"
+            exit 1
+          fi
+
+      # always() so a failed apply or a failed assertion still tears down
+      # whatever was created. Orphaned resources in the sandbox project are
+      # both a cost problem and a name-collision problem for the next run.
+      - name: terraform destroy
+        if: always()
+        working-directory: examples/basic
+        env:
+          GOOGLE_PROJECT: ${{ inputs.gcp-project-id }}
+          TF_VAR_project_id: ${{ inputs.gcp-project-id }}
+          TF_VAR_name_suffix: ${{ steps.suffix.outputs.value }}
+        run: terraform destroy -input=false -auto-approve
