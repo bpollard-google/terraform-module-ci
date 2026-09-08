@@ -1,0 +1,177 @@
+name: agent
+
+# The agentic runner's dispatcher. It federates into the *invoker* service
+# account and starts one of two Cloud Run Jobs; it never runs the agent itself
+# and never sees the GitHub App private key. The key is read inside the job, by
+# the separate module-agent service account attached to it — see
+# infra/gcp/agent.tf for why those are two accounts and not one.
+#
+# THIS WORKFLOW MUST NOT `uses:` nightly.yml, in any job, ever.
+# infra/gcp/wif.tf maps attribute.caller out of job_workflow_ref, which names
+# the INNERMOST reusable workflow of a run. A job here that called the nightly
+# would mint a token whose caller reads "<owner>/<repo>/nightly.yml", and that
+# principal is bound to tf-module-nightly — project-wide compute.networkAdmin
+# and compute.securityAdmin. The two-account split would collapse with nothing
+# to show for it in a diff. Keep the two shared workflows siblings.
+
+on:
+  workflow_call:
+    inputs:
+      wif-provider:
+        description: Full resource name of the Workload Identity Provider.
+        type: string
+        required: true
+      service-account:
+        description: >-
+          Email of the agent *invoker* service account. Not the one the
+          nightly uses, and not the one attached to the jobs.
+        type: string
+        required: true
+      gcp-project-id:
+        description: Project the Cloud Run Jobs live in.
+        type: string
+        required: true
+      gcp-region:
+        description: Region the Cloud Run Jobs live in. Not the model location.
+        type: string
+        required: true
+      triage-job:
+        description: Name of the triage Cloud Run Job.
+        type: string
+        required: true
+      build-job:
+        description: Name of the build Cloud Run Job.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+# Keyed on the issue, not the repository: two different issues are two
+# independent agent runs and there is no reason to serialise them.
+#
+# cancel-in-progress is false. Both jobs below return as soon as Cloud Run
+# accepts the execution, so cancelling one would not stop the execution it
+# already started — it would only throw away the log line saying which one.
+concurrency:
+  group: agent-${{ github.repository }}-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    name: triage
+    # Both jobs live in one workflow because the caller subscribes to one event
+    # type. The two `if`s are what make them mutually exclusive, and they are
+    # the whole of the authorisation story on this side: `labeled` is the only
+    # way to reach the build job, and only for one label name.
+    if: github.event.action == 'opened'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # token_format: access_token, so the step below can call the Cloud Run
+      # API directly. See the comment on that step for why it is not gcloud.
+      - id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          token_format: access_token
+          workload_identity_provider: ${{ inputs.wif-provider }}
+          service_account: ${{ inputs.service-account }}
+
+      # NOT `gcloud run jobs execute --update-env-vars`, and the reason is a
+      # measured permission, not a preference.
+      #
+      # roles/run.jobsExecutorWithOverrides — verified with
+      # `gcloud iam roles describe` — grants exactly run.executions.cancel,
+      # run.jobs.run and run.jobs.runWithOverrides. It does NOT grant
+      # run.jobs.get. gcloud's `run jobs execute` validates override flags
+      # against the job before starting anything: ValidateConfigOverrides
+      # reaches GetJob whenever an override flag is present, and --async does
+      # not skip it because --async only short-circuits later, inside RunJob.
+      # So the gcloud form fails with PERMISSION_DENIED on run.jobs.get,
+      # naming a permission nothing in this repository asks for.
+      #
+      # The alternative was to add roles/run.viewer per job. That works, but it
+      # widens the grant the whole two-account split is argued from, to buy a
+      # call gcloud makes for its own client-side validation. The v2 REST
+      # endpoint needs run.jobs.runWithOverrides and nothing else.
+      #
+      # There is no --async equivalent to ask for: jobs.run returns a
+      # long-running Operation as soon as Cloud Run accepts the execution. The
+      # job reports back by commenting on the issue, which is where anyone is
+      # looking.
+      #
+      # ISSUE_NUMBER and REPO are per-execution container overrides, which is
+      # why the invoker needs runWithOverrides rather than plain run.invoker.
+      # They reach the request through jq and through `env:` rather than being
+      # interpolated into the script or the JSON: a ${{ }} expansion is
+      # textual, so an issue number that was not a number could otherwise close
+      # the quoting and continue the command.
+      #
+      # --fail-with-body is load-bearing. Without it curl exits 0 on a 403 and
+      # this job is green with no execution started, which is indistinguishable
+      # from a working demo until nobody's issue gets triaged.
+      - name: Start the triage run
+        shell: bash
+        env:
+          TOKEN: ${{ steps.auth.outputs.access_token }}
+          JOB: ${{ inputs.triage-job }}
+          PROJECT: ${{ inputs.gcp-project-id }}
+          REGION: ${{ inputs.gcp-region }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          body="$(jq -nc --arg issue "$ISSUE_NUMBER" --arg repo "$REPO" \
+            '{overrides:{containerOverrides:[{env:[
+               {name:"ISSUE_NUMBER",value:$issue},
+               {name:"REPO",value:$repo}]}]}}')"
+          curl --fail-with-body --silent --show-error \
+            -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$body" \
+            "https://run.googleapis.com/v2/projects/$PROJECT/locations/$REGION/jobs/$JOB:run"
+
+  build:
+    name: build
+    # One label, by exact name. `github.event.action == 'labeled'` alone would
+    # start a build for every label anyone applies, which includes the agent's
+    # own type:* and risk:* labels from triage — a triage run would start a
+    # build of its own findings.
+    if: github.event.action == 'labeled' && github.event.label.name == 'agent:approved'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          token_format: access_token
+          workload_identity_provider: ${{ inputs.wif-provider }}
+          service_account: ${{ inputs.service-account }}
+
+      # Identical to the triage step, and deliberately spelled out rather than
+      # shared: the two differ in exactly one input, and a reusable workflow
+      # cannot loop a job over a matrix of triggers.
+      - name: Start the build run
+        shell: bash
+        env:
+          TOKEN: ${{ steps.auth.outputs.access_token }}
+          JOB: ${{ inputs.build-job }}
+          PROJECT: ${{ inputs.gcp-project-id }}
+          REGION: ${{ inputs.gcp-region }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          body="$(jq -nc --arg issue "$ISSUE_NUMBER" --arg repo "$REPO" \
+            '{overrides:{containerOverrides:[{env:[
+               {name:"ISSUE_NUMBER",value:$issue},
+               {name:"REPO",value:$repo}]}]}}')"
+          curl --fail-with-body --silent --show-error \
+            -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$body" \
+            "https://run.googleapis.com/v2/projects/$PROJECT/locations/$REGION/jobs/$JOB:run"
