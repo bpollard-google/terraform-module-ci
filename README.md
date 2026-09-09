@@ -50,8 +50,8 @@ the module passed everything and only the doc injection broke.
 A non-zero exit carrying **no** marker means the script was killed before it
 could speak, not that it passed. `INT`, `TERM` and `HUP` are trapped and do
 report — a `timeout` sends `TERM`, so a timed-out run is reported. Any other
-fatal signal is not: `KILL` and `PIPE` cannot be trapped at all, and `USR1`,
-`XCPU`, `ALRM` and the rest are not handled.
+fatal signal is not: `KILL` cannot be trapped at all, and `PIPE`, `USR1`,
+`XCPU`, `ALRM` and the rest are trappable but are not handled.
 
 Five of the seven are checks that can fail the run — init, validate, tflint,
 `terraform test` and checkov. The other two, `fmt` and `terraform-docs`, are

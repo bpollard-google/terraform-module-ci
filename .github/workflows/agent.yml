@@ -98,9 +98,20 @@ jobs:
       # endpoint needs run.jobs.runWithOverrides and nothing else.
       #
       # There is no --async equivalent to ask for: jobs.run returns a
-      # long-running Operation as soon as Cloud Run accepts the execution. The
-      # job reports back by commenting on the issue, which is where anyone is
-      # looking.
+      # long-running Operation as soon as Cloud Run accepts the execution, and
+      # this step never polls it.
+      #
+      # THAT IS AN ACCEPTED GAP, NOT A DEFENDED ONE. This comment used to
+      # justify it with "the job reports back by commenting on the issue,
+      # which is where anyone is looking" -- which is false in exactly the
+      # failure it produces: a job that dies on startup comments nothing, and
+      # this workflow is a green tick regardless. It is also circular, since
+      # the comment is written by the execution whose outcome is the thing not
+      # being checked. It really happened: a stale image sat undetected behind
+      # a green run. `docs/known-limitations.md` carries it as an open defect
+      # with the poll and its cost written out. What --fail-with-body below
+      # covers is narrower and worth not confusing with it: that Cloud Run
+      # ACCEPTED the execution, not that the execution did anything.
       #
       # ISSUE_NUMBER and REPO are per-execution container overrides, which is
       # why the invoker needs runWithOverrides rather than plain run.invoker.
