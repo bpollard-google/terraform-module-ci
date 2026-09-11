@@ -50,9 +50,11 @@ permissions:
 # Keyed on the issue, not the repository: two different issues are two
 # independent agent runs and there is no reason to serialise them.
 #
-# cancel-in-progress is false. Both jobs below return as soon as Cloud Run
-# accepts the execution, so cancelling one would not stop the execution it
-# already started — it would only throw away the log line saying which one.
+# cancel-in-progress is false, and it matters more now than it did. The jobs
+# below wait for the execution they start, so a cancelled run IS a runner
+# sitting in a poll — but cancelling it would not stop the Cloud Run execution,
+# which has no dependency on this workflow at all. All a cancellation buys is
+# throwing away the only place the outcome is reported.
 concurrency:
   group: agent-${{ github.repository }}-${{ github.event.issue.number }}
   cancel-in-progress: false
@@ -97,22 +99,6 @@ jobs:
       # call gcloud makes for its own client-side validation. The v2 REST
       # endpoint needs run.jobs.runWithOverrides and nothing else.
       #
-      # There is no --async equivalent to ask for: jobs.run returns a
-      # long-running Operation as soon as Cloud Run accepts the execution, and
-      # this step never polls it.
-      #
-      # THAT IS AN ACCEPTED GAP, NOT A DEFENDED ONE. This comment used to
-      # justify it with "the job reports back by commenting on the issue,
-      # which is where anyone is looking" -- which is false in exactly the
-      # failure it produces: a job that dies on startup comments nothing, and
-      # this workflow is a green tick regardless. It is also circular, since
-      # the comment is written by the execution whose outcome is the thing not
-      # being checked. It really happened: a stale image sat undetected behind
-      # a green run. `docs/known-limitations.md` carries it as an open defect
-      # with the poll and its cost written out. What --fail-with-body below
-      # covers is narrower and worth not confusing with it: that Cloud Run
-      # ACCEPTED the execution, not that the execution did anything.
-      #
       # ISSUE_NUMBER and REPO are per-execution container overrides, which is
       # why the invoker needs runWithOverrides rather than plain run.invoker.
       # They reach the request through jq and through `env:` rather than being
@@ -120,10 +106,62 @@ jobs:
       # textual, so an issue number that was not a number could otherwise close
       # the quoting and continue the command.
       #
-      # --fail-with-body is load-bearing. Without it curl exits 0 on a 403 and
-      # this job is green with no execution started, which is indistinguishable
-      # from a working demo until nobody's issue gets triaged.
-      - name: Start the triage run
+      # --fail-with-body is load-bearing on BOTH calls. Without it curl exits 0
+      # on a 403 and this job is green having started nothing, or green having
+      # read an error document as an execution status.
+      #
+      # THEN IT WAITS, and that is the half this step did not used to have.
+      #
+      # `jobs.run` returns a long-running Operation as soon as Cloud Run
+      # ACCEPTS the execution, which says nothing about what the execution
+      # then did. This step used to return there, and the comment that stood
+      # here justified it with "the job reports back by commenting on the
+      # issue, which is where anyone is looking". That is false in exactly the
+      # failure it produces — a job that dies on startup comments nothing —
+      # and circular besides, since the comment would be written by the
+      # execution whose outcome was the thing not being checked. It really
+      # happened, twice: three triage executions came back Completed=False
+      # with `No module named agent.entrypoint`, the Agent workflow reported
+      # success on all three, and eleven tasks were built on the stale image
+      # behind them.
+      #
+      # So: the execution's full resource name is in the Operation's
+      # `metadata` (its @type is google.cloud.run.v2.Execution), and that is
+      # the ONLY way this caller can learn which execution is its own — the
+      # invoker cannot list a job's executions. The poll GETs that name until
+      # the `Completed` condition appears, and fails the step when it appears
+      # CONDITION_FAILED.
+      #
+      # THREE RULES IN THE LOOP, each protecting against a different wrong
+      # answer:
+      #
+      #  - Only CONDITION_SUCCEEDED is success and only CONDITION_FAILED is
+      #    failure. An execution in flight carries no `Completed` condition at
+      #    all, and CONDITION_RECONCILING is a real fourth value of the enum,
+      #    so both `!= FAILED` and `!= SUCCEEDED` would be wrong, in opposite
+      #    directions. Anything unrecognised keeps waiting.
+      #  - A status that cannot be READ is an unknown outcome, never a good
+      #    one. It is retried, because a single 503 in a long build's worth of
+      #    polls is not evidence; three consecutive failures are fatal, which
+      #    is where a missing run.executions.get grant lands.
+      #
+      #    "Cannot be read" means the FETCH AND THE PARSE TOGETHER, which is
+      #    why they are one `&&` condition rather than two statements. An HTTP
+      #    200 carrying something that is not JSON — a proxy error page, an
+      #    interception layer — is a read that produced no state, and with the
+      #    parse outside the condition it took neither the retry nor the
+      #    `::error::`: jq exited 5, `set -e` killed the step, and one garbled
+      #    response ended a run whose execution was fine. Failing closed was
+      #    not the problem; the contract this comment states being untrue was.
+      #  - The wait is bounded, and the bound is just above the Cloud Run task
+      #    timeout for this job (infra/gcp/variables.tf: triage_task_timeout,
+      #    300s) plus provisioning slack. Shorter and a legitimately running
+      #    execution is reported failed while it goes on to succeed; longer
+      #    and the runner waits past the point at which the execution can
+      #    still be running at all. demo/tests/test_workflows.sh pins the two
+      #    numbers to each other so raising one silently cannot leave the
+      #    other behind.
+      - name: Start the triage run and wait for it
         shell: bash
         env:
           TOKEN: ${{ steps.auth.outputs.access_token }}
@@ -132,17 +170,60 @@ jobs:
           REGION: ${{ inputs.gcp-region }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           REPO: ${{ github.repository }}
+          # 300s of task timeout plus two minutes of provisioning slack.
+          POLL_TIMEOUT_SECONDS: "420"
+          POLL_INTERVAL_SECONDS: "10"
         run: |
           body="$(jq -nc --arg issue "$ISSUE_NUMBER" --arg repo "$REPO" \
             '{overrides:{containerOverrides:[{env:[
                {name:"ISSUE_NUMBER",value:$issue},
                {name:"REPO",value:$repo}]}]}}')"
-          curl --fail-with-body --silent --show-error \
+          operation="$(curl --fail-with-body --silent --show-error \
             -X POST \
             -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: application/json" \
             --data "$body" \
-            "https://run.googleapis.com/v2/projects/$PROJECT/locations/$REGION/jobs/$JOB:run"
+            "https://run.googleapis.com/v2/projects/$PROJECT/locations/$REGION/jobs/$JOB:run")"
+
+          execution="$(jq -re '.metadata.name' <<<"$operation")"
+          echo "started $execution"
+
+          deadline=$(( SECONDS + POLL_TIMEOUT_SECONDS ))
+          misses=0
+          while :; do
+            if status="$(curl --fail-with-body --silent --show-error \
+                -H "Authorization: Bearer $TOKEN" \
+                "https://run.googleapis.com/v2/$execution" 2>&1)" \
+               && state="$(jq -re \
+                 '[.conditions[]? | select(.type == "Completed")][0].state // "PENDING"' \
+                 <<<"$status" 2>&1)"; then
+              misses=0
+              case "$state" in
+                CONDITION_SUCCEEDED)
+                  echo "$execution succeeded"
+                  exit 0
+                  ;;
+                CONDITION_FAILED)
+                  echo "::error::$execution failed: $(jq -r \
+                    '[.conditions[]? | select(.type == "Completed")][0].message // "no message"' \
+                    <<<"$status")"
+                  exit 1
+                  ;;
+              esac
+            else
+              misses=$(( misses + 1 ))
+              echo "could not read $execution (attempt $misses): $status"
+              if [ "$misses" -ge 3 ]; then
+                echo "::error::gave up reading the status of $execution after $misses consecutive failures; the invoker needs run.executions.get on this job (infra/gcp/agent.tf)"
+                exit 1
+              fi
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::$execution did not finish within ${POLL_TIMEOUT_SECONDS}s; the task timeout is lower than that, so it should already have"
+              exit 1
+            fi
+            sleep "$POLL_INTERVAL_SECONDS"
+          done
 
   build:
     name: build
@@ -164,9 +245,19 @@ jobs:
           service_account: ${{ inputs.service-account }}
 
       # Identical to the triage step, and deliberately spelled out rather than
-      # shared: the two differ in exactly one input, and a reusable workflow
-      # cannot loop a job over a matrix of triggers.
-      - name: Start the build run
+      # shared: the two differ in exactly one input and in their deadline, and
+      # a reusable workflow cannot loop a job over a matrix of triggers. Read
+      # the triage step's comment for why every line of this is here; both
+      # copies are driven through the same behavioural assertions in
+      # demo/tests/test_workflows.sh, which is what makes the duplication safe.
+      #
+      # THE DEADLINE IS THE ONE REAL DIFFERENCE, and it is NOT
+      # build_soft_deadline_seconds (600). That is an in-process deadline the
+      # agent loop checks between iterations; an overrun past it is caught by
+      # Cloud Run at build_task_timeout, which is 1800s. Polling to 720s would
+      # therefore report a build that is still legitimately running as failed,
+      # while it went on to succeed and comment on the issue.
+      - name: Start the build run and wait for it
         shell: bash
         env:
           TOKEN: ${{ steps.auth.outputs.access_token }}
@@ -175,14 +266,59 @@ jobs:
           REGION: ${{ inputs.gcp-region }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           REPO: ${{ github.repository }}
+          # 1800s of task timeout plus two minutes of provisioning slack. Well
+          # inside both the access token's hour and GitHub's six-hour job cap,
+          # so the poll can never be the thing that ends the run.
+          POLL_TIMEOUT_SECONDS: "1920"
+          POLL_INTERVAL_SECONDS: "10"
         run: |
           body="$(jq -nc --arg issue "$ISSUE_NUMBER" --arg repo "$REPO" \
             '{overrides:{containerOverrides:[{env:[
                {name:"ISSUE_NUMBER",value:$issue},
                {name:"REPO",value:$repo}]}]}}')"
-          curl --fail-with-body --silent --show-error \
+          operation="$(curl --fail-with-body --silent --show-error \
             -X POST \
             -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: application/json" \
             --data "$body" \
-            "https://run.googleapis.com/v2/projects/$PROJECT/locations/$REGION/jobs/$JOB:run"
+            "https://run.googleapis.com/v2/projects/$PROJECT/locations/$REGION/jobs/$JOB:run")"
+
+          execution="$(jq -re '.metadata.name' <<<"$operation")"
+          echo "started $execution"
+
+          deadline=$(( SECONDS + POLL_TIMEOUT_SECONDS ))
+          misses=0
+          while :; do
+            if status="$(curl --fail-with-body --silent --show-error \
+                -H "Authorization: Bearer $TOKEN" \
+                "https://run.googleapis.com/v2/$execution" 2>&1)" \
+               && state="$(jq -re \
+                 '[.conditions[]? | select(.type == "Completed")][0].state // "PENDING"' \
+                 <<<"$status" 2>&1)"; then
+              misses=0
+              case "$state" in
+                CONDITION_SUCCEEDED)
+                  echo "$execution succeeded"
+                  exit 0
+                  ;;
+                CONDITION_FAILED)
+                  echo "::error::$execution failed: $(jq -r \
+                    '[.conditions[]? | select(.type == "Completed")][0].message // "no message"' \
+                    <<<"$status")"
+                  exit 1
+                  ;;
+              esac
+            else
+              misses=$(( misses + 1 ))
+              echo "could not read $execution (attempt $misses): $status"
+              if [ "$misses" -ge 3 ]; then
+                echo "::error::gave up reading the status of $execution after $misses consecutive failures; the invoker needs run.executions.get on this job (infra/gcp/agent.tf)"
+                exit 1
+              fi
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::$execution did not finish within ${POLL_TIMEOUT_SECONDS}s; the task timeout is lower than that, so it should already have"
+              exit 1
+            fi
+            sleep "$POLL_INTERVAL_SECONDS"
+          done
